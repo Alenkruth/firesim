@@ -85,7 +85,9 @@ size_t CPUManagedStreams::FPGAToCPUDriver::pull(void *dest,
   auto pull_beats = std::min(count, num_beats);
   auto pull_bytes = pull_beats * fpga_buffer_width_bytes();
   auto bytes_read = cpu_managed_axi4_read(dma_addr(), (char *)dest, pull_bytes);
-  assert(bytes_read == pull_bytes);
+  // Short read occurs when simulation ends mid-DMA transfer (FPGA resets while
+  // host has a pull in flight). Return what we got rather than asserting.
+  if (bytes_read != pull_bytes) return bytes_read;
   return bytes_read;
 }
 

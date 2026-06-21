@@ -247,6 +247,12 @@ class UserTopologies:
         servers = [FireSimServerNode() for y in range(1)]
         self.roots[0].add_downlinks(servers)
 
+    def example_1config(self) -> None:
+        """Single NIC node behind a software switch. Use with NIC-equipped bitstreams
+        when no_net_config would stall the simulation due to missing NIC credits."""
+        self.roots = [FireSimSwitchNode()]
+        self.roots[0].add_downlinks([FireSimServerNode()])
+
     def example_2config(self) -> None:
         self.roots = [FireSimSwitchNode()]
         servers = [FireSimServerNode() for y in range(2)]

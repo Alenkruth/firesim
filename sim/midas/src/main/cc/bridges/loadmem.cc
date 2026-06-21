@@ -2,7 +2,9 @@
 
 #include "loadmem.h"
 
+#include <elf.h>
 #include <fstream>
+#include <cstring>
 
 #include "core/simif.h"
 
@@ -19,8 +21,68 @@ loadmem_t::loadmem_t(simif_t &simif,
   assert(index == 0 && "only one loadmem widget is allowed");
 }
 
+// Load a sparse ELF file by writing each PT_LOAD segment directly via DMA.
+// addr argument is relative to DRAM base (offset 0 = physical 0x80000000).
+static const uint64_t DRAM_BASE = 0x80000000ULL;
+
 void loadmem_t::load_mem_from_file(const std::string &filename) {
   fprintf(stdout, "[loadmem] start loading file: %s\n", filename.c_str());
+
+  // Detect ELF by magic bytes.
+  {
+    std::ifstream probe(filename, std::ios::binary);
+    if (!probe) {
+      fprintf(stderr, "[loadmem] cannot open %s\n", filename.c_str());
+      exit(EXIT_FAILURE);
+    }
+    unsigned char magic[4] = {0};
+    probe.read(reinterpret_cast<char*>(magic), 4);
+    if (magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') {
+      fprintf(stdout, "[loadmem] detected ELF format, loading PT_LOAD segments\n");
+      std::ifstream elf(filename, std::ios::binary);
+      // Read ELF64 header.
+      Elf64_Ehdr ehdr;
+      elf.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
+      fprintf(stdout, "[loadmem] %u program headers\n", ehdr.e_phnum);
+      for (int i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+        elf.seekg(ehdr.e_phoff + i * ehdr.e_phentsize);
+        elf.read(reinterpret_cast<char*>(&phdr), sizeof(phdr));
+        if (phdr.p_type != PT_LOAD) continue;
+        if (phdr.p_filesz == 0) continue;
+        uint64_t paddr = phdr.p_paddr;
+        if (paddr < DRAM_BASE) {
+          fprintf(stderr, "[loadmem] skipping segment at 0x%lx (below DRAM base)\n", paddr);
+          continue;
+        }
+        uint64_t offset = paddr - DRAM_BASE;
+        fprintf(stdout, "[loadmem] segment paddr=0x%lx offset=0x%lx filesz=0x%lx\n",
+                paddr, offset, phdr.p_filesz);
+        // Read segment data in 4KB chunks and write via write_mem_chunk.
+        const size_t chunk_bytes = 4096;
+        std::vector<uint8_t> buf(chunk_bytes, 0);
+        elf.seekg(phdr.p_offset);
+        uint64_t remaining = phdr.p_filesz;
+        uint64_t cur_offset = offset;
+        mpz_t mpz_buf;
+        mpz_init(mpz_buf);
+        while (remaining > 0) {
+          size_t to_read = std::min((uint64_t)chunk_bytes, remaining);
+          std::fill(buf.begin(), buf.end(), 0);
+          elf.read(reinterpret_cast<char*>(buf.data()), to_read);
+          mpz_import(mpz_buf, to_read, -1, 1, 0, 0, buf.data());
+          write_mem_chunk(cur_offset, mpz_buf, to_read);
+          cur_offset += to_read;
+          remaining -= to_read;
+        }
+        mpz_clear(mpz_buf);
+      }
+      fprintf(stdout, "[loadmem] ELF load done\n");
+      return;
+    }
+  }
+
+  // Fall through to original hex format loading.
   std::ifstream file(filename.c_str());
   if (!file) {
     fprintf(stderr, "[loadmem] cannot open %s\n", filename.c_str());
@@ -28,7 +90,7 @@ void loadmem_t::load_mem_from_file(const std::string &filename) {
   }
 
   const size_t chunk = mem_conf.data_bits / 4;
-  fprintf(stdout, "[loadmem] start loading, chunk = %ld\n", chunk);
+  fprintf(stdout, "[loadmem] start loading hex, chunk = %ld\n", chunk);
 
   size_t addr = 0;
   std::string line;

@@ -32,6 +32,9 @@ delete_files [list ${root_dir}/vivado_proj/firesim.bit]
 create_project -force firesim ${root_dir}/vivado_proj -part $part
 set_property board_part $board_part [current_project]
 
+# try setting max threads to 20 to maximize CPU usage on pyro
+set_param general.maxThreads 20
+
 # Loading all the verilog files
 foreach addFile [list \
     ${root_dir}/design/axi_tieoff_master.v \

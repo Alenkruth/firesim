@@ -18,6 +18,11 @@ set_property -dict [ list \
   {STEPS.POST_ROUTE_PHYS_OPT_DESIGN.MORE OPTIONS} "$post_phys_options" \
 ] ${impl_run}
 
+# Apply pBlock placement constraints before place_design (no-op if pblocks.tcl not present)
+if {[file exists ${root_dir}/scripts/pblocks.tcl]} {
+  set_property STEPS.PLACE_DESIGN.TCL.PRE ${root_dir}/scripts/pblocks.tcl ${impl_run}
+}
+
 if {$route_phys_opt} {
   set run_to_step {phys_opt_design (Post-Route)}
 } else {
