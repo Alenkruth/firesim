@@ -16,3 +16,6 @@ scala-doc-env.sh
 vivado*.log
 vivado*.jou
 __pycache__
+*.pre-*
+*.broken
+*.NOTSOURCED
