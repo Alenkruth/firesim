@@ -4,6 +4,9 @@ proc create_ddr_sdram_intf_port { name } {
    return [ create_bd_intf_port -mode Master -vlnv xilinx.com:interface:ddr4_rtl:1.0 $name ]
 }
 set ddr4_sdram_c0 [ create_ddr_sdram_intf_port ddr4_sdram_c0 ]
+# Second host-DRAM channel (32 GiB total). Uses DDR bank c3 + default_300mhz_clk3,
+# which are free; banks/clocks c1/c2 are consumed by the Aurora clk wizards.
+set ddr4_sdram_c3 [ create_ddr_sdram_intf_port ddr4_sdram_c3 ]
 
 proc create_300mhz_clk_intf_port { name } {
    set shared_clk_props [ list \
@@ -38,13 +41,23 @@ set_property -dict [ list \
 
 proc create_ddr_intf_port { name firesim_freq_hz } {
    set i [ create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 $name ]
+   # ADDR_WIDTH MUST be set explicitly. Vivado defaults an aximm_rtl port to 32
+   # bits, which silently truncated bits [33:32] at the overall_fpga_top ->
+   # design_1 boundary and re-inserted them as constant zero at the MIG
+   # (.c0_ddr4_s_axi_awaddr({1'b0,1'b0,...})). Every DRAM access therefore folded
+   # modulo 4 GiB: a write to byte offset 0x1_0000_0000 landed at 0. A DDR4 bank
+   # here is 16 GiB, so the port needs 34 bits. This capped the design at 4 GiB of
+   # usable DRAM regardless of HostMemNumChannels, and an aliasing memtest cannot
+   # detect it because reads fold exactly the same way writes do.
    set_property -dict [ list \
       CONFIG.FREQ_HZ $firesim_freq_hz \
       CONFIG.DATA_WIDTH 64 \
+      CONFIG.ADDR_WIDTH 34 \
    ] $i
    return $i
 }
 set DDR4_0_S_AXI [ create_ddr_intf_port DDR4_0_S_AXI $firesim_freq_hz ]
+set DDR4_1_S_AXI [ create_ddr_intf_port DDR4_1_S_AXI $firesim_freq_hz ]
 
 proc create_qsfp_clk_intf_port { name } {
    set i [ create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 $name ]

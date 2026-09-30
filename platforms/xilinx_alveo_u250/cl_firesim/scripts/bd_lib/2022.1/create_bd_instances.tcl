@@ -5,6 +5,10 @@ set axi_clock_converter_0 [ create_axi_clock_converter axi_clock_converter_0 ]
 set axi_clock_converter_1 [ create_axi_clock_converter axi_clock_converter_1 ]
 
 proc create_axi_dwidth_converter { name } {
+   # ADDR_WIDTH is set explicitly rather than inherited from the DDR4_n_S_AXI
+   # port. Relying on propagation is what let a defaulted 32-bit port width reach
+   # both sides of this converter and fold all DRAM access modulo 4 GiB. A 16 GiB
+   # DDR4 bank needs 34 bits; keep this in sync with create_ddr_intf_port.
    set axi_dwidth_props [list \
       CONFIG.MI_DATA_WIDTH.VALUE_SRC USER \
       CONFIG.ACLK_ASYNC {1} \
@@ -12,12 +16,14 @@ proc create_axi_dwidth_converter { name } {
       CONFIG.MI_DATA_WIDTH {512} \
       CONFIG.SI_DATA_WIDTH {64} \
       CONFIG.SI_ID_WIDTH {16} \
+      CONFIG.ADDR_WIDTH {34} \
    ]
    set i [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dwidth_converter:2.1 $name ]
    set_property -dict $axi_dwidth_props $i
    return $i
 }
 set axi_dwidth_converter_0 [ create_axi_dwidth_converter axi_dwidth_converter_0 ]
+set axi_dwidth_converter_1 [ create_axi_dwidth_converter axi_dwidth_converter_1 ]
 
 proc create_axi_tieoff_master { name } {
    set block_name axi_tieoff_master
@@ -32,6 +38,7 @@ proc create_axi_tieoff_master { name } {
    return $i
 }
 set axi_tieoff_master_0 [ create_axi_tieoff_master axi_tieoff_master_0 ]
+set axi_tieoff_master_1 [ create_axi_tieoff_master axi_tieoff_master_1 ]
 
 set clk_wiz_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:6.0 clk_wiz_0 ]
 set_property -dict [list \
@@ -56,6 +63,9 @@ proc create_ddr { name clk_intf ddr_intf } {
    return $i
 }
 set ddr4_0 [ create_ddr ddr4_0 default_300mhz_clk0 ddr4_sdram_c0 ]
+# Second host-DRAM controller on bank c3 / clk3 (the system clock stays sourced
+# from ddr4_0 only; ddr4_1 is a pure memory slave).
+set ddr4_1 [ create_ddr ddr4_1 default_300mhz_clk3 ddr4_sdram_c3 ]
 
 set proc_sys_reset_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 proc_sys_reset_0 ]
 
@@ -63,6 +73,7 @@ proc create_proc_sys_reset_ddr { name } {
    return [ create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 $name ]
 }
 set proc_sys_reset_ddr_0 [ create_proc_sys_reset_ddr proc_sys_reset_ddr_0 ]
+set proc_sys_reset_ddr_1 [ create_proc_sys_reset_ddr proc_sys_reset_ddr_1 ]
 
 set resetn_inv_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:util_vector_logic:2.0 resetn_inv_0 ]
 set_property -dict [list \

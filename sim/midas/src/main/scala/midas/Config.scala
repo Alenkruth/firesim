@@ -134,7 +134,12 @@ class F1Config
 class XilinxAlveoU250Config
     extends Config(new Config((_, _, _) => {
       case F1ShimHasQSFPPorts  => true
-      case HostMemNumChannels  => 1
+      // 2 host-DRAM channels (2 x 16 GiB = 32 GiB). The cl_firesim shell wires
+      // DDR bank c0 (system clock source) + bank c3, so io_slave_0/io_slave_1 of
+      // F1Shim are both connected. A single 32 GiB FASED region spans both host
+      // channels via address routing in FPGATop. Raise to 4 only if banks c1/c2
+      // (currently used by the Aurora clk wizards) are also wired.
+      case HostMemNumChannels  => 2
       case PreLinkCircuitPath  => Some("firesim_top")
       case PostLinkCircuitPath => Some("firesim_top")
     }) ++ new F1Config ++ new SimConfig)
