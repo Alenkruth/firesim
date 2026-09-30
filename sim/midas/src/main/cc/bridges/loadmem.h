@@ -42,6 +42,12 @@ public:
   void write_mem(size_t addr, mpz_t &value);
   void write_mem_chunk(size_t addr, mpz_t &value, size_t bytes);
 
+  // Debug: read the OpenSBI M-mode trap context off the M-stack derived from
+  // mscratch and print it (mepc, mstatus/MPP, all 32 GPRs). Uses the LoadMem
+  // DMA read path only -- never halts the hart -- so it is safe to call after
+  // a run to inspect whatever trap the firmware last took.
+  void dump_trap_regs(uint64_t mscratch);
+
   // Helper to zero out all DRAM.
   void zero_out_dram();
 

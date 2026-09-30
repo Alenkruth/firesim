@@ -33,6 +33,9 @@ simulation_t::simulation_t(widget_registry_t &registry,
     if (arg.find("+write-fingerprint=") == 0) {
       write_fingerprint_only = atoi(arg.c_str() + 19);
     }
+    if (arg.find("+dump-mstack=") == 0) {
+      dump_mstack_scratch = strtoull(arg.c_str() + 13, nullptr, 0);
+    }
   }
 
   if (fastloadmem)
@@ -145,6 +148,20 @@ int simulation_t::execute_simulation_flow() {
   record_end_times();
 
   simulation_finish();
+
+  // Debug: after the run, read the OpenSBI M-mode trap context off the M-stack
+  // (DMA read via LoadMem -- no halt) to name whatever trap the firmware wedged
+  // in. Gated on +dump-mstack=<mscratch>, so normal runs are unaffected.
+  if (dump_mstack_scratch.has_value()) {
+    if (auto *loadmem = registry.get_widget_opt<loadmem_t>()) {
+      fprintf(stderr,
+              "Dumping OpenSBI M-stack trap context (mscratch=0x%" PRIx64 ")\n",
+              *dump_mstack_scratch);
+      loadmem->dump_trap_regs(*dump_mstack_scratch);
+    } else {
+      fprintf(stderr, "+dump-mstack set but target has no LoadMem widget\n");
+    }
+  }
 
   const bool timeout = simulation_timed_out();
 

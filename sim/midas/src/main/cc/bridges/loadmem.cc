@@ -2,9 +2,11 @@
 
 #include "loadmem.h"
 
+#include <cinttypes>
 #include <elf.h>
 #include <fstream>
 #include <cstring>
+#include <cstdlib>
 
 #include "core/simif.h"
 
@@ -44,6 +46,30 @@ void loadmem_t::load_mem_from_file(const std::string &filename) {
       Elf64_Ehdr ehdr;
       elf.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
       fprintf(stdout, "[loadmem] %u program headers\n", ehdr.e_phnum);
+
+      // Read the first 8 bytes at a DRAM offset through the loadmem read path.
+      // CAVEAT: on any bitstream built before the LoadMem.scala rAddrH fix, the
+      // widget drops the high address bits, so a probe at offset >= 4 GiB actually
+      // reads (offset & 0xffffffff). Only offsets below 4 GiB are trustworthy there.
+      auto probe8 = [&](uint64_t off, uint8_t out[8]) {
+        mpz_t rb;
+        mpz_init(rb);
+        read_mem(off, rb);
+        size_t nw = 0;
+        uint32_t *rw =
+            (uint32_t *)mpz_export(nullptr, &nw, -1, sizeof(uint32_t), 0, 0, rb);
+        for (size_t b = 0; b < 8; b++) {
+          size_t w = b / 4;
+          out[b] = (rw && w < nw) ? (uint8_t)((rw[w] >> (8 * (b % 4))) & 0xff) : 0;
+        }
+        mpz_clear(rb);
+      };
+
+      // Diagnostics gate (OFF by default): the per-segment offset-0 PROBE and the
+      // post-loop VERIFY self-check below were the 0x1e-corruption probe, resolved by
+      // the LoadMem.scala rAddrH fix. Set LOADMEM_VERIFY=1 in the env to re-enable.
+      const bool lm_verify = (std::getenv("LOADMEM_VERIFY") != nullptr);
+
       for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr phdr;
         elf.seekg(ehdr.e_phoff + i * ehdr.e_phentsize);
@@ -76,6 +102,63 @@ void loadmem_t::load_mem_from_file(const std::string &filename) {
           remaining -= to_read;
         }
         mpz_clear(mpz_buf);
+
+        // Offset 0 (the M-mode firmware, and tohost/fromhost) reads back as 0x1e
+        // instead of the image. Re-probe it after EVERY segment so the corruption is
+        // attributed to an exact write: if it is already wrong right after segment 0,
+        // segment 0's own write never landed; if it turns wrong only after a later
+        // segment, that segment's address is aliasing down onto offset 0.
+        if (lm_verify) {
+          uint8_t z[8];
+          probe8(0, z);
+          fprintf(stdout,
+                  "[loadmem] PROBE offset=0 after segment %d (paddr=0x%lx):",
+                  i, paddr);
+          for (size_t b = 0; b < 8; b++) fprintf(stdout, " %02x", z[b]);
+          fprintf(stdout, "\n");
+        }
+      }
+      // Self-check: read back the first bytes of each PT_LOAD through the SAME
+      // loadmem widget we just wrote through. This runs before the hart executes, so
+      // it isolates "the DMA write landed in DRAM" from any cache/coherence or
+      // debug-module read-path question. Probing the target showed segment 0
+      // (0x80000000) reading back as 0x1e/0x01 instead of the image, while a segment
+      // at 0x100c00000 read back byte-exact -- this pins down which side is wrong.
+      if (lm_verify) {
+        elf.clear();
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+          Elf64_Phdr vph;
+          elf.seekg(ehdr.e_phoff + i * ehdr.e_phentsize);
+          elf.read(reinterpret_cast<char*>(&vph), sizeof(vph));
+          if (vph.p_type != PT_LOAD || vph.p_filesz == 0) continue;
+          if (vph.p_paddr < DRAM_BASE) continue;
+          uint8_t expect[8] = {0};
+          elf.seekg(vph.p_offset);
+          elf.read(reinterpret_cast<char*>(expect), sizeof(expect));
+          mpz_t rb;
+          mpz_init(rb);
+          read_mem(vph.p_paddr - DRAM_BASE, rb);
+          size_t nw = 0;
+          uint32_t *rw = (uint32_t *)mpz_export(nullptr, &nw, -1, sizeof(uint32_t), 0, 0, rb);
+          uint8_t got[8] = {0};
+          for (size_t b = 0; b < sizeof(got); b++) {
+            size_t w = b / 4;
+            got[b] = (w < nw) ? (uint8_t)((rw[w] >> (8 * (b % 4))) & 0xff) : 0;
+          }
+          bool match = true;
+          for (size_t b = 0; b < sizeof(got); b++) if (got[b] != expect[b]) match = false;
+          // A read at offset >= 4 GiB is only meaningful once the widget honours
+          // The >=4GiB read path is fixed (LoadMem.scala rAddrH) and present in the
+          // flashed bitstream: the 0x85cc00000 segment reads back byte-exact. An old
+          // caveat here reported such segments as "UNVERIFIABLE" even when got==expect,
+          // which hid a real PASS behind a scary label. Report the actual comparison.
+          fprintf(stdout, "[loadmem] VERIFY paddr=0x%lx expect=", (uint64_t)vph.p_paddr);
+          for (size_t b = 0; b < sizeof(expect); b++) fprintf(stdout, "%02x ", expect[b]);
+          fprintf(stdout, " got=");
+          for (size_t b = 0; b < sizeof(got); b++) fprintf(stdout, "%02x ", got[b]);
+          fprintf(stdout, " %s\n", match ? "OK" : "**MISMATCH**");
+          mpz_clear(rb);
+        }
       }
       fprintf(stdout, "[loadmem] ELF load done\n");
       return;
@@ -155,4 +238,68 @@ void loadmem_t::zero_out_dram() {
   simif.write(mmio_addrs.ZERO_OUT_DRAM, 1);
   while (!simif.read(mmio_addrs.ZERO_FINISHED))
     ;
+}
+
+void loadmem_t::dump_trap_regs(uint64_t mscratch) {
+  // OpenSBI _trap_handler saves the trap context on the M-stack derived from
+  // mscratch. Verified against the checkpoint firmware disassembly:
+  //   sp = mscratch - 280
+  //   struct sbi_trap_regs at sp+0 .. sp+248: 32 xregs in the order
+  //     zero,ra,sp,gp,tp,t0,t1,t2,s0,s1,a0..a7,s2..s11,t3..t6
+  //   mepc    @ sp+256
+  //   mstatus @ sp+264   (mstatusH @ sp+272)
+  // Read purely through the LoadMem DMA path (read_mem) -- no halt()/resume().
+  const uint64_t sp = mscratch - 280;
+  const size_t beat_bytes = (size_t)mem_data_chunk * sizeof(uint32_t);
+  const uint64_t region_lo = sp & ~((uint64_t)beat_bytes - 1);
+  const uint64_t last_byte = sp + 279; // through mstatusH
+  const size_t nbeats =
+      (size_t)(((last_byte & ~((uint64_t)beat_bytes - 1)) - region_lo) /
+               beat_bytes) +
+      1;
+
+  std::vector<uint8_t> mem(nbeats * beat_bytes, 0);
+  for (size_t b = 0; b < nbeats; b++) {
+    mpz_t rb;
+    mpz_init(rb);
+    read_mem((region_lo - DRAM_BASE) + b * beat_bytes, rb);
+    size_t nw = 0;
+    uint32_t *rw =
+        (uint32_t *)mpz_export(nullptr, &nw, -1, sizeof(uint32_t), 0, 0, rb);
+    for (size_t w = 0; w < beat_bytes / 4; w++) {
+      uint32_t v = (rw && w < nw) ? rw[w] : 0;
+      for (int k = 0; k < 4; k++)
+        mem[b * beat_bytes + w * 4 + k] = (uint8_t)((v >> (8 * k)) & 0xff);
+    }
+    mpz_clear(rb);
+  }
+
+  auto dw = [&](uint64_t vaddr) -> uint64_t {
+    size_t idx = (size_t)(vaddr - region_lo);
+    uint64_t x = 0;
+    for (int k = 0; k < 8; k++)
+      x |= (uint64_t)mem[idx + k] << (8 * k);
+    return x;
+  };
+
+  static const char *names[32] = {
+      "zero", "ra", "sp",  "gp",  "tp", "t0", "t1", "t2", "s0", "s1", "a0",
+      "a1",   "a2", "a3",  "a4",  "a5", "a6", "a7", "s2", "s3", "s4", "s5",
+      "s6",   "s7", "s8",  "s9",  "s10","s11","t3", "t4", "t5", "t6"};
+  const uint64_t mepc = dw(sp + 256);
+  const uint64_t mstatus = dw(sp + 264);
+
+  fprintf(stdout,
+          "[mstack] mscratch=0x%016" PRIx64 " sp=0x%016" PRIx64
+          " (%zu beats x %zu B)\n",
+          mscratch, sp, nbeats, beat_bytes);
+  fprintf(stdout, "[mstack] mepc    = 0x%016" PRIx64 "\n", mepc);
+  fprintf(stdout,
+          "[mstack] mstatus = 0x%016" PRIx64 "  MPP=%" PRIu64
+          " (0=U,1=S,3=M)\n",
+          mstatus, (mstatus >> 11) & 3);
+  for (int i = 0; i < 32; i++)
+    fprintf(stdout, "[mstack]   x%-2d %-4s = 0x%016" PRIx64 "\n", i, names[i],
+            dw(sp + i * 8));
+  fflush(stdout);
 }

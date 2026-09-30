@@ -141,6 +141,13 @@ private:
    */
   std::optional<uint32_t> write_fingerprint_only;
 
+  /**
+   * If set (+dump-mstack=<mscratch>), after the run read the OpenSBI M-mode
+   * trap context off the M-stack derived from this mscratch value and print it
+   * (mepc/mstatus/GPRs). DMA read only -- never halts the hart.
+   */
+  std::optional<uint64_t> dump_mstack_scratch;
+
   midas_time_t start_time;
   midas_time_t end_time;
   std::optional<uint64_t> start_hcycle;
