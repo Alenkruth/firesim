@@ -145,7 +145,12 @@ class LoadMemWidget(val totalDRAMAllocated: BigInt)(implicit p: Parameters) exte
     reqArb.io.in(0)           <> wAddrQ.io.deq
     reqArb.io.in(1).valid     := zeroOutDram.valid
     reqArb.io.in(1).bits.zero := true.B
-    reqArb.io.in(1).bits.addr := extMem.base.U
+    // Start at 0, NOT extMem.base. This widget's address space is host-DRAM-relative and
+    // 0-based (the driver writes `paddr - 0x80000000`), but extMem.base is a TARGET address
+    // (0x80000000). Using it started the sweep 2 GiB in and then ran totalDRAMAllocated
+    // beats from there, overrunning the top of the region -- those writes decode to no
+    // slave on the xbar. Zeroing [0, totalDRAMAllocated) is what was always intended.
+    reqArb.io.in(1).bits.addr := 0.U
     reqArb.io.in(1).bits.len  := (totalDRAMAllocated >> log2Ceil(hWidth / 8)).U
     zeroOutDram.ready         := reqArb.io.in(1).ready
 
@@ -159,12 +164,30 @@ class LoadMemWidget(val totalDRAMAllocated: BigInt)(implicit p: Parameters) exte
     writer.io.mem.r.bits   := DontCare
     writer.io.data         <> wDataQ.io.out
 
-    attach(writer.io.req.ready, "ZERO_FINISHED", ReadOnly)
+    // ZERO_FINISHED must mean "the zero sweep has COMPLETED", not "the writer is idle".
+    // It was wired straight to writer.io.req.ready (= state === s_idle), so the driver's
+    // `while (!read(ZERO_FINISHED));` could observe idle in the window between writing
+    // ZERO_OUT_DRAM and the arbiter handing the request to the writer -- returning
+    // immediately and letting a multi-GiB background zero sweep race the ELF load.
+    // Latch on the request appearing, clear only once the writer is idle again.
+    val zeroInFlight = RegInit(false.B)
+    when(zeroOutDram.valid) {
+      zeroInFlight := true.B
+    }.elsewhen(writer.io.req.ready) {
+      zeroInFlight := false.B
+    }
+    attach(!zeroInFlight && writer.io.req.ready, "ZERO_FINISHED", ReadOnly)
 
     val rAddrH = genWOReg(Wire(UInt(max(0, hKey.addrBits - 32).W)), "R_ADDRESS_H")
     val rAddrQ = genAndAttachQueue(Wire(Decoupled(UInt(hKey.addrBits.W))), "R_ADDRESS_L")
 
-    memNasti.ar.bits  := NastiReadAddressChannel(hKey, id = 0.U, addr = Cat(rAddrH, rAddrQ.bits), size = size)
+    // rAddrQ is declared addrBits wide but the driver only ever writes its low 32
+    // bits (R_ADDRESS_L). Concatenating the full width gives addrBits+32 bits, which
+    // truncates to addrBits on assignment and silently DROPS rAddrH -- so every read
+    // above 4 GiB targeted the wrong address. Clamp to 32 like the write path does at
+    // wAddrL, so Cat(rAddrH, ...) is exactly addrBits wide.
+    val rAddrL        = rAddrQ.bits(min(32, hKey.addrBits) - 1, 0)
+    memNasti.ar.bits  := NastiReadAddressChannel(hKey, id = 0.U, addr = Cat(rAddrH, rAddrL), size = size)
     memNasti.ar.valid := rAddrQ.valid
     rAddrQ.ready      := memNasti.ar.ready
 
