@@ -34,6 +34,11 @@ class BuildStrategy(Enum):
     TIMING = auto()
     EXPLORE = auto()
     CONGESTION = auto()
+    # Selects strategy_AREA_CONGESTION.tcl: AreaOptimized_high synthesis WITHOUT -no_lc
+    # (so LUT combining is allowed) plus AltSpreadLogic_high placement.  For designs that
+    # fail ROUTING while CLB-bound -- high CLB occupancy at moderate LUT percentage --
+    # where TIMING's -no_lc spends the exact resource that is scarce.
+    AREA_CONGESTION = auto()
     NORETIMING = auto()
     DEFAULT = auto()
 
