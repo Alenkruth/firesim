@@ -2,6 +2,13 @@
 #include "core/simif.h"
 
 #include <cassert>
+#include <cerrno>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <sys/types.h>
 
 using namespace CPUManagedStreams;
 
@@ -84,10 +91,43 @@ size_t CPUManagedStreams::FPGAToCPUDriver::pull(void *dest,
 
   auto pull_beats = std::min(count, num_beats);
   auto pull_bytes = pull_beats * fpga_buffer_width_bytes();
+
+  // [DRVXDMA] A destination that is not page-aligned lets the XDMA driver split the
+  // read at a host page boundary that is not a beat multiple; the two halves then read
+  // one more beat than the queue holds and the transfer never completes (FireSim
+  // issue #208; see page_aligned_sized_array in core/bridge_driver.h).  Warn once so
+  // a bridge with an unaligned buffer is named instead of showing up as a 10 s hang.
+  constexpr uintptr_t kHostPageBytes = 4096;
+  static bool warned_unaligned = false;
+  if (!warned_unaligned && (reinterpret_cast<uintptr_t>(dest) & (kHostPageBytes - 1)) &&
+      ((reinterpret_cast<uintptr_t>(dest) & (kHostPageBytes - 1)) + pull_bytes > kHostPageBytes)) {
+    warned_unaligned = true;
+    fprintf(stderr,
+            "[CPUManagedStream] WARNING: pull from card addr 0x%" PRIx64 " into %p: the "
+            "destination is not page-aligned and this %zu-byte read crosses a page; "
+            "XDMA reads may hang (FireSim #208)\n",
+            (uint64_t)dma_addr(), dest, (size_t)pull_bytes);
+  }
+
   auto bytes_read = cpu_managed_axi4_read(dma_addr(), (char *)dest, pull_bytes);
-  // Short read occurs when simulation ends mid-DMA transfer (FPGA resets while
+  // [DRVXDMA] cpu_managed_axi4_read returns pread()'s ssize_t as size_t, so a failed
+  // read (XDMA c2h timeout: -ETIMEDOUT/-EIO) arrived here as SIZE_MAX and was passed
+  // up as a byte count; the IFT bridge then read past its buffer (SIGSEGV).  After a
+  // failed read the FPGA queue has been partly dequeued and its AXI read is still
+  // outstanding, so the stream can no longer be trusted: stop with a clear message
+  // instead of crashing or blocking 10 s on every later pull.
+  if (static_cast<ssize_t>(bytes_read) < 0) {
+    const int err = errno;
+    fprintf(stderr,
+            "[CPUManagedStream] FATAL: DMA read of %zu bytes from card addr 0x%" PRIx64
+            " failed: %s (errno %d). The stream is no longer framed; stopping the "
+            "driver (exit 74).\n",
+            (size_t)pull_bytes, (uint64_t)dma_addr(), strerror(err), err);
+    fflush(stdout);
+    exit(74);
+  }
+  // Short read: can occur when simulation ends mid-DMA transfer (FPGA resets while
   // host has a pull in flight). Return what we got rather than asserting.
-  if (bytes_read != pull_bytes) return bytes_read;
   return bytes_read;
 }
 
