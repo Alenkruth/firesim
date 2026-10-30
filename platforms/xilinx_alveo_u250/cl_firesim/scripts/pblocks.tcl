@@ -78,6 +78,38 @@ if {[llength $merge_cells] > 0} {
     }
 }
 
+# ---------------------------------------------------------------------------
+# [F2a] lean58 (timing-audit-20261023 section 6, F2 (a); owner order 2026-10-23): replicate the drivers of the D$
+# reconfiguration registers cfg_set_applied / cfg_way_applied (dcache.scala, ENABLE_RECONF).  lean57's worst path
+# (core group +2.716 ns, all 10 worst paths) starts at dcache/cfg_set_applied_reg[0], fan-out 148, with a 3.64 ns
+# first net across SLR2 to the MSHR rpq idx-match LUTs.  They change only on a 0xbc1 reconfiguration.  No RTL
+# change: FORCE_MAX_FANOUT makes phys_opt_design (enabled in strategy TIMING, directive AggressiveExplore)
+# replicate the driver so no copy drives more than 16 loads, placed near its loads; MAX_FANOUT carries the same
+# limit for any later fan-out optimization.  Functionally exact (replicas are copies of the same flop).
+# Guarded (-quiet) and loud: a no-op prints a CRITICAL WARNING, never an error (a TCL error here kills the run).
+# ---------------------------------------------------------------------------
+set ENABLE_DCFG_FANOUT 1
+set dcfg_fanout 16
+if {$ENABLE_DCFG_FANOUT} {
+    set dcfg_regs [get_cells -quiet -hierarchical -filter \
+        "NAME =~ ${boom_root}/*cfg_set_applied_reg* || NAME =~ ${boom_root}/*cfg_way_applied_reg*"]
+    # keep the D$ copies only (other modules have their own cfg_*_applied registers)
+    set dcfg_d {}
+    foreach c $dcfg_regs { if {[string match "*dcache*" $c]} { lappend dcfg_d $c } }
+    set dcfg_nets [get_nets -quiet -of_objects [get_pins -quiet -of_objects $dcfg_d -filter {DIRECTION == OUT && REF_PIN_NAME == Q}]]
+    if {[llength $dcfg_nets] == 0} {
+        puts "CRITICAL WARNING: \[F2a\] no dcache cfg_set_applied/cfg_way_applied nets matched -- fan-out limit NOT applied"
+    } elseif {[catch {
+        set_property FORCE_MAX_FANOUT $dcfg_fanout $dcfg_nets
+        set_property MAX_FANOUT $dcfg_fanout $dcfg_nets
+    } err]} {
+        puts "CRITICAL WARNING: \[F2a\] setting FORCE_MAX_FANOUT failed (non-fatal): $err"
+    } else {
+        puts "INFO: \[F2a\] FORCE_MAX_FANOUT/MAX_FANOUT $dcfg_fanout on [llength $dcfg_nets] nets of [llength $dcfg_d] dcache cfg registers"
+        foreach n $dcfg_nets { puts "INFO: \[F2a\]   $n fanout=[get_property FLAT_PIN_COUNT $n]" }
+    }
+}
+
 # 2026-08-23: SLR0 left-edge exclusion for the IFTDMI build.
 # The May IFTDMI build failed timing with ALL 56 violations in PCIe4/DDR4 hard IP (0 logic
 # levels = pure routing) — BOOM logic crowded onto SLR0's left edge (PCIE40E4_X0Y1,
