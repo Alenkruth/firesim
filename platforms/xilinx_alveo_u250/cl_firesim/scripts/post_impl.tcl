@@ -53,6 +53,33 @@ lean58_report high_fanout_nets_timing {
 lean58_report utilization_slr {
     report_utilization -slr -file ${rpt_dir}/final_utilization_slr.rpt
 }
+# [v3] record-v3 / sink-capture measurements (09 V3.6, spec SP-27).  Same non-fatal wrapper as lean58: a reporting
+# failure never stops the bitstream/mcs write below.  The cell patterns name the registers the v3 specs add or
+# reuse (SP-08 edges.dc.way -> *dc_way*, SP-15/16/18/19 cf_state_*, SP-17 sq_lane_r1, SP-20 out); a pattern that matches no cell prints a
+# CRITICAL WARNING and writes no report.  rpt_dir is passed in because a proc does not see the caller's variables.
+proc v3_cells {pat} {
+    return [get_cells -hier -quiet -filter "IS_SEQUENTIAL && NAME =~ $pat"]
+}
+proc v3_timing_report {name pat dir rd} {
+    set c [v3_cells $pat]
+    if {[llength $c] == 0} {
+        puts "CRITICAL WARNING: \[v3 report\] $name: no sequential cell matches $pat"
+        return
+    }
+    puts "INFO: \[v3 report\] $name: [llength $c] cells match $pat"
+    lean58_report v3_$name {
+        report_timing -$dir $c -max_paths 50 -nworst 1 -unique_pins -sort_by slack -file ${rd}/final_timing_v3_${name}.rpt
+    }
+}
+# the two approved +1 sites (design 6.4): the lane mux before sq_lane_r1 and the D$ footprint way encoder,
+# and the D-S2 third site (SP-20): the [B61LDQ] reader-edge port register `out` of lsu.scala, whose D input gains
+# the new-edge 2:1 select
+v3_timing_report lane_mux        {*sq_lane_r1*} to   $rpt_dir
+v3_timing_report dc_footprint    {*dc_way*}     to   $rpt_dir
+v3_timing_report lsu_edge_port   {*out_bits_prod_op_count*} to $rpt_dir
+# the STATE taps, the D$ alignment stages and both sides of the SLR2-SLR3 cut (frontend cut-out, tile cut-in)
+v3_timing_report state_taps_to   {*cf_state*}   to   $rpt_dir
+v3_timing_report state_taps_from {*cf_state*}   from $rpt_dir
 
 close_design
 
