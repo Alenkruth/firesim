@@ -218,13 +218,109 @@ if {$ENABLE_XDMA_PBLOCK} {
 }
 
 # ---------------------------------------------------------------------------
+# NARROW XDMA interface pblock -- ENABLED for all U250 builds (owner 2026-10-27, "All future builds").
+#
+# This is NOT pblock_xdma above (all ~145k xdma_0/inst cells in X4Y4:X7Y7; unroutable 2026-08-30, stays
+# disabled).  It holds only the soft leaf cells of xdma_0/inst/pcie4_ip_i (PCIe4 wrapper: pipe_inst incl.
+# pcie4_0_512b_intfc_mod, gt_top_i soft logic; ~41k cells = ~10.9k LUT + 25k FF + 22 BRAM), HARD, in the
+# 2x2 clock regions at the PCIe hard block (PCIE40E4_X0Y1 -> X7Y4, so X6Y4:X7Y5 = SLR1).  LOC'd hard blocks
+# (PCIE40E4, GTYE4, BUFG*, IBUFDS*) are left out; the DMA engine (udma_*) and AXI logic stay free.  No
+# EXCLUDE_PLACEMENT, so other logic may still use the region.
+# Why: v3_2 failed timing because the 512b interface flops (2 ns TXOUTCLK[3]_3 paths into PCIE40E4 SAXIS*)
+# were placed in SLR0 and crossed SLR0/SLR1 twice; all 13 passing builds had them in SLR1 Y246-316
+# (task-reports/v3_2-timing-rootcause-20261027.md e5b4b659, slr-split-why-20261027.md 161e7750).  The v3_2
+# re-implementation with exactly this pblock met timing (WNS 0.007, WHS 0.009; pblock CLB LUT 27%, FF 25%).
+# Same filter/region code as phase4/v3_2-pblock/scripts/pblock_xdma_intfc.tcl (3d59d655); only the abort
+# paths are changed to loud CRITICAL WARNINGs (an error in this TCL.PRE hook fails the impl/IDR run).
+# The shell BD (xdma_0) is identical for every recipe, so IFT, baseline and reconf builds all get it.
+# ---------------------------------------------------------------------------
+set ENABLE_XDMA_INTFC_PBLOCK 1
+if {$ENABLE_XDMA_INTFC_PBLOCK} {
+    set _xi_ok 1
+    if {[llength [get_pblocks -quiet pblock_xdma_intfc]] > 0} {
+        # IDR/RQS hooks re-source this file; a dcp that already carries the pblock keeps it as is
+        puts "INFO: \[xdma_intfc\] pblock_xdma_intfc already present ([llength [get_cells -quiet -of_objects [get_pblocks pblock_xdma_intfc]]] cells) -- kept"
+        set _xi_ok 0
+    } elseif {[llength [get_pblocks -quiet pblock_xdma]] > 0} {
+        puts "CRITICAL WARNING: \[xdma_intfc\] pblock_xdma (the wide anchor) is enabled and already owns these cells -- pblock_xdma_intfc NOT APPLIED"
+        set _xi_ok 0
+    }
+    if {$_xi_ok} {
+        set pipe_pat {design_1_i/xdma_0/inst/pcie4_ip_i/*}
+        # leaf, not LOC-fixed, not the hard block / GT / clock buffers
+        set intfc_cells [get_cells -quiet -hierarchical -filter \
+            "NAME =~ $pipe_pat && IS_PRIMITIVE && REF_NAME !~ PCIE40E4* && REF_NAME !~ GTYE4* && REF_NAME !~ BUFG* && REF_NAME !~ IBUFDS*"]
+        set keep {}
+        if {[llength $intfc_cells] > 0} {
+            foreach c $intfc_cells l [get_property -quiet LOC $intfc_cells] {
+                if {$l eq ""} { lappend keep $c }
+            }
+        }
+        set intfc_cells $keep
+        set n512 [llength [lsearch -all -glob $intfc_cells *pcie4_0_512b_intfc_mod*]]
+        if {[llength $intfc_cells] == 0} {
+            puts "CRITICAL WARNING: \[xdma_intfc\] no cell matched $pipe_pat (netlist has no U250 XDMA) -- pblock_xdma_intfc NOT APPLIED"
+            set _xi_ok 0
+        } elseif {$n512 == 0} {
+            puts "CRITICAL WARNING: \[xdma_intfc\] no pcie4_0_512b_intfc_mod cell among [llength $intfc_cells] matches (XDMA hierarchy changed) -- pblock_xdma_intfc NOT APPLIED"
+            set _xi_ok 0
+        }
+    }
+    if {$_xi_ok} {
+        # Region from the LOC'd PCIe hard block (measured CLOCKREGION_X7Y4 on 2026-08-28)
+        set cr_col ""; set cr_row ""
+        set pcie_sites [get_sites -quiet -of_objects \
+                          [get_cells -quiet -hierarchical -filter {REF_NAME =~ PCIE40E4*}]]
+        if {[llength $pcie_sites] > 0} {
+            set cr [get_clock_regions -quiet -of_objects [lindex $pcie_sites 0]]
+            if {[llength $cr] > 0 && [regexp {X(\d+)Y(\d+)} [lindex $cr 0] -> cc rr]} {
+                set cr_col $cc; set cr_row $rr
+                puts "INFO: \[xdma_intfc\] PCIe [lindex $pcie_sites 0] -> CLOCKREGION_X${cc}Y${rr} (derived)"
+            }
+        }
+        if {$cr_col eq ""} {
+            set cr_col 7; set cr_row 4
+            puts "CRITICAL WARNING: \[xdma_intfc\] could not derive the PCIe clock region -- using X7Y4"
+        }
+        # 2 columns wide (towards the die centre), 2 rows tall, kept inside the PCIe's SLR (4 CR rows per SLR on U250)
+        set col_hi $cr_col
+        set col_lo [expr {$cr_col > 0 ? $cr_col - 1 : 0}]
+        set slr_lo [expr {($cr_row / 4) * 4}]
+        set slr_hi [expr {$slr_lo + 3}]
+        if {$cr_row + 1 <= $slr_hi} {
+            set row_lo $cr_row; set row_hi [expr {$cr_row + 1}]
+        } else {
+            set row_lo [expr {$cr_row - 1}]; set row_hi $cr_row
+        }
+        set region "CLOCKREGION_X${col_lo}Y${row_lo}:CLOCKREGION_X${col_hi}Y${row_hi}"
+        if {[catch {
+            create_pblock pblock_xdma_intfc
+            add_cells_to_pblock [get_pblocks pblock_xdma_intfc] $intfc_cells
+            resize_pblock [get_pblocks pblock_xdma_intfc] -add $region
+            set_property IS_SOFT 0 [get_pblocks pblock_xdma_intfc]
+        } err]} {
+            catch {delete_pblocks [get_pblocks -quiet pblock_xdma_intfc]}
+            puts "CRITICAL WARNING: \[xdma_intfc\] creating pblock_xdma_intfc failed (non-fatal, removed): $err -- NOT APPLIED"
+        } else {
+            puts "INFO: \[xdma_intfc\] pblock_xdma_intfc HARD over $region: [llength $intfc_cells] cells ($n512 in pcie4_0_512b_intfc_mod)"
+            if {[llength $intfc_cells] > 90000} {
+                puts "CRITICAL WARNING: \[xdma_intfc\] [llength $intfc_cells] cells is far above the expected ~41k -- check the filter"
+            }
+            array unset _rt
+            foreach g [get_property PRIMITIVE_GROUP $intfc_cells] { incr _rt($g) }
+            foreach k [lsort [array names _rt]] { puts "INFO: \[xdma_intfc\]   $k: $_rt($k)" }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Loud summary: a silent no-op here cost a full 14h build on 2026-08-25.
 # Never errors out (would kill a multi-hour run) -- just makes failure visible.
 # ---------------------------------------------------------------------------
 set _pb [get_pblocks -quiet]
 puts "INFO: ===== PBLOCK SUMMARY ====="
 puts "INFO: pblocks present: [llength $_pb] -> $_pb"
-foreach _n {pblock_csr pblock_ras pblock_xdma} {
+foreach _n {pblock_csr pblock_ras pblock_xdma pblock_xdma_intfc} {
     if {[lsearch -exact $_pb $_n] < 0} {
         puts "CRITICAL WARNING: PBLOCK NOT APPLIED: $_n (cell filter matched nothing)"
     } else {
