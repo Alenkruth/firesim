@@ -83,7 +83,11 @@ def main(args: List[str]) -> int:
     megroup2.add_argument("--bitstream", help="The bitstream to flash onto FPGA(s)", type=Path)
     megroup2.add_argument("--disconnect-bdf", help="Disconnect BDF(s)", action="store_true")
     megroup2.add_argument("--reconnect-bdf", help="Reconnect BDF(s)", action="store_true")
+    # [TWO-CARD] opt-in; a command-line flag (not an env var) so it survives the sudo re-exec
+    parser.add_argument("--card-scoped", help="Touch only the given BDF: refuse while its xdma nodes are held, rescan only its root port (never the global rescan), masked COMMAND write", action="store_true")
     parsed_args = parser.parse_args(args)
+    if parsed_args.card_scoped and not (parsed_args.bdf or parsed_args.bus_id or parsed_args.extended_bdf):
+        sys.exit(":ERROR: --card-scoped needs one --bdf/--bus_id/--extended-bdf (all-* and --serial are host-wide)")
 
     if parsed_args.hw_server_bin is None:
         parsed_args.hw_server_bin = shutil.which('hw_server')
@@ -133,14 +137,29 @@ def main(args: List[str]) -> int:
         return bus_ids
 
     def disconnect_bus_id(bus_id: str) -> None:
+        if parsed_args.card_scoped:
+            # refuse before any PCIe write while this card's nodes are held
+            pcielib.refuse_if_card_held(bus_id, "before PCIe writes")
+            # remember the root port now (stock looks it up after the remove) and
+            # validate the rescan target before the card is removed
+            pcielib.remember_bridges(bus_id)
+            pcielib.card_bus_rescan_path(bus_id)
         pcielib.clear_serr_bits(bus_id)
         pcielib.clear_fatal_error_reporting_bits(bus_id)
+        if parsed_args.card_scoped:
+            pcielib.refuse_if_card_held(bus_id, "before sysfs remove")
         pcielib.remove(bus_id)
         assert not pcielib.any_device_exists(bus_id), f"{bus_id} still visible. Check for proper removal."
 
     def reconnect_bus_id(bus_id: str) -> None:
-        pcielib.rescan(bus_id)
-        pcielib.enable_memmapped_transfers(bus_id)
+        if parsed_args.card_scoped:
+            # xdma stayed loaded: the probe runs inside this rescan and sets BusMaster;
+            # a full COMMAND=0x02 write would clear it, so the write is masked
+            pcielib.rescan_card_scoped(bus_id)
+            pcielib.enable_memmapped_transfers_masked(bus_id)
+        else:
+            pcielib.rescan(bus_id)
+            pcielib.enable_memmapped_transfers(bus_id)
         assert pcielib.any_device_exists(bus_id), f"{bus_id} not visible. Check for proper rescan."
 
     # program based on bitstream

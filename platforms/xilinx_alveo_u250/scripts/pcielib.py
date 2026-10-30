@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import re
@@ -127,6 +128,117 @@ def remove(bus_id: str) -> None:
         removePath = devicePaths.resolve().absolute() / 'remove'
         if removePath.exists():
             write_to_linux_device_path(removePath)
+
+# [TWO-CARD] card-scoped helpers (used only by firesim-fpga-util.py --card-scoped).
+# The stock rescan() below derives the parent bridge from the device's sysfs entry,
+# which no longer exists after remove(); its bridge loop is then empty and only the
+# GLOBAL /sys/bus/pci/rescan (every root port, every card) re-adds the card.
+# Card-scoped mode remembers the bridge BEFORE the remove and rescans only that root
+# port's secondary bus (<rootport>/pci_bus/0000:<bus>, reached via the stable
+# /sys/class/pci_bus/0000:<bus> link, which survives the endpoint's removal, so a
+# standalone --reconnect-bdf --card-scoped also recovers a removed card).
+pciBusClassPath = Path('/sys/class/pci_bus')
+procPath = Path('/proc')
+_bridge_cache: Dict[str, List[Path]] = {}
+_bdf_re = re.compile(r'^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$')
+
+def remember_bridges(bus_id: str) -> None:
+    bridges = get_bridge_paths(bus_id)
+    if len(bridges) != 1:
+        sys.exit(f":ERROR: expected exactly one parent bridge for {bus_id}, found {bridges}")
+    _bridge_cache[bus_id] = bridges
+
+def card_bus_rescan_path(bus_id: str) -> Path:
+    """<rootport>/pci_bus/0000:<bus>/rescan; refuses a root bus (whose rescan would
+    walk a whole host bridge) and a target that disagrees with the parent bridge
+    remembered before the remove (or seen now, if the card is present)."""
+    busLink = pciBusClassPath / f'0000:{bus_id}'
+    if not busLink.exists():
+        sys.exit(f":ERROR: {busLink} missing; refusing the global rescan (card-scoped)")
+    busNode = busLink.resolve()
+    owner = busNode.parent.parent  # .../<rootport>/pci_bus/0000:<bus> -> <rootport>
+    if busNode.parent.name != 'pci_bus' or not _bdf_re.match(owner.name):
+        sys.exit(f":ERROR: {busLink} -> {busNode} is not a bridge's secondary bus; refusing (card-scoped)")
+    expected = _bridge_cache.get(bus_id) or get_bridge_paths(bus_id)
+    if len(expected) > 1 or (len(expected) == 1 and expected[0].resolve() != owner):
+        sys.exit(f":ERROR: {busLink} owner {owner} disagrees with parent bridge {expected}; refusing (card-scoped)")
+    return busNode / 'rescan'
+
+def rescan_card_scoped(bus_id: str) -> None:
+    busRescan = card_bus_rescan_path(bus_id)
+    if not busRescan.exists():
+        sys.exit(f":ERROR: {busRescan} missing; refusing the global rescan (card-scoped)")
+    write_to_linux_device_path(busRescan)
+    if not any_device_exists(bus_id):
+        sys.exit(f":ERROR: {bus_id} did not reappear after {busRescan}; refusing the global rescan (card-scoped)")
+
+def card_device_nodes(bus_id: str) -> List[str]:
+    """Paths whose open fd or mmap pins this card's xdma state: /dev/<name> for every
+    entry under <dev>/xdma/ and the device's own sysfs resource* (BAR) files."""
+    nodes = []
+    for dev in get_device_paths(bus_id):
+        real = dev.resolve()
+        xdmaDir = real / 'xdma'
+        if xdmaDir.is_dir():
+            nodes.extend(str(Path('/dev') / e.name) for e in sorted(xdmaDir.iterdir()))
+        nodes.extend(str(r) for r in sorted(real.glob('resource*')))
+    return nodes
+
+def card_node_holders(bus_id: str) -> Dict[str, List[str]]:
+    """pid -> this card's nodes it holds open (fd) or mapped (maps). An unreadable
+    /proc entry (other than a process exiting mid-scan) counts as a holder."""
+    nodes = set(card_device_nodes(bus_id))
+    holders: Dict[str, List[str]] = {}
+    if not nodes:
+        return holders
+    for pdir in procPath.iterdir():
+        if not pdir.name.isdigit():
+            continue
+        hit = set()
+        try:
+            for fd in (pdir / 'fd').iterdir():
+                try:
+                    tgt = os.readlink(fd)
+                except FileNotFoundError:
+                    continue
+                if tgt.endswith(' (deleted)'):
+                    tgt = tgt[:-len(' (deleted)')]
+                if tgt in nodes:
+                    hit.add(tgt)
+            with open(pdir / 'maps') as f:
+                for line in f:
+                    parts = line.rstrip('\n').split(None, 5)
+                    if len(parts) == 6:
+                        p = parts[5]
+                        if p.endswith(' (deleted)'):
+                            p = p[:-len(' (deleted)')]
+                        if p in nodes:
+                            hit.add(p)
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # process exited during the scan
+        except PermissionError as e:
+            hit.add(f"<unreadable: {e}>")
+        if hit:
+            holders[pdir.name] = sorted(hit)
+    return holders
+
+def refuse_if_card_held(bus_id: str, when: str) -> None:
+    """Replaces rmmod's EBUSY refusal: the sysfs remove frees the device even while a
+    process holds its /dev/xdmaN_* fds or BAR mmap."""
+    holders = card_node_holders(bus_id)
+    if holders:
+        detail = "; ".join(f"pid {p}: {', '.join(n)}" for p, n in sorted(holders.items()))
+        sys.exit(f":ERROR: [TWO-CARD] {when}: card bus {bus_id} is in use ({detail}). "
+                 f"Refusing the sysfs remove / PCIe writes; stop those processes first (card-scoped)")
+
+# masked write: set Memory Space Enable only, keep BusMaster/SERR# (and every other
+# bit) that the xdma probe, which now runs inside the bus rescan, already set
+def enable_memmapped_transfers_masked(bus_id: str) -> None:
+    for deviceBDF in get_device_extended_bdfs(bus_id):
+        run = subprocess.run(['setpci', '-s', deviceBDF, 'COMMAND=0002:0002'])
+        if run.returncode != 0:
+            sys.exit(f":ERROR: Unable to enable memmapped transfers on {deviceBDF}")
+        time.sleep(1)
 
 def rescan(bus_id: str) -> None:
     for bridgePath in get_bridge_paths(bus_id):

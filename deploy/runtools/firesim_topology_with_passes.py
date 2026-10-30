@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import os
+import contextlib
 import pprint
 import logging
 import datetime
@@ -14,6 +15,7 @@ from colorama import Fore, Style  # type: ignore
 from functools import reduce
 from tempfile import TemporaryDirectory
 
+from runtools import card_scope
 from runtools.firesim_topology_elements import (
     FireSimNode,
     FireSimPipeNode,
@@ -231,6 +233,15 @@ class FireSimTopologyWithPasses:
             "gviz_graph",
             filename="generated-topology-diagrams/firesim_topology"
             + self.user_topology_name
+            # [TWO-CARD] per-card file (two managers rendering one .gv corrupted it);
+            # stock name when card scoping is off.
+            + (
+                card_scope.gv_suffix(
+                    [n.fpga_db for n in self.run_farm.get_all_host_nodes()]
+                )
+                if card_scope.enabled()
+                else ""
+            )
             + ".gv",
             node_attr={"shape": "record", "height": ".1"},
         )
@@ -599,7 +610,15 @@ class FireSimTopologyWithPasses:
                 )
 
         servers = self.firesimtopol.get_dfs_order_servers()
-        execute(build_drivers_helper, servers, hosts=["localhost"])
+        # [TWO-CARD] card-scoped: one driver make + tarball at a time in the shared
+        # sim/ tree (infrasetup, runworkload, builddriver); never held over a flash.
+        build_lock = (
+            card_scope.CardLock(rootLogger, "build")
+            if card_scope.enabled()
+            else contextlib.nullcontext()
+        )
+        with build_lock:
+            execute(build_drivers_helper, servers, hosts=["localhost"])
 
     def pass_build_required_switches(self) -> None:
         """Build all the switches required for this simulation."""
@@ -769,6 +788,15 @@ class FireSimTopologyWithPasses:
 
         def screens() -> None:
             """poll on screens to make sure kill succeeded."""
+            # [TWO-CARD] card-scoped: wait only for this manager's fsim<slot>-<bus>
+            # screens, not for another card's run on the same host.
+            my_node = self.run_farm.lookup_by_host(env.host_string)
+            own_screens = (
+                my_node.instance_deploy_manager.card_screen_names()
+                if my_node is not None and my_node.instance_deploy_manager is not None
+                else None
+            )
+            own_re = card_scope.screen_regex(own_screens) if own_screens else None
             with warn_only():
                 rootLogger.info("Confirming exit...")
                 # keep checking screen until it reports that there are no screens left
@@ -787,7 +815,11 @@ class FireSimTopologyWithPasses:
                     # Previously, it only exited successfully when there was no screen at all. However,
                     # that lead to pathological behaviors when there were other screens running.
                     elif (
-                        ("fsim" in screenoutput)
+                        (
+                            ("fsim" in screenoutput)
+                            if own_re is None
+                            else (own_re.search(screenoutput) is not None)
+                        )
                         or ("switch" in screenoutput)
                         or ("pipe" in screenoutput)
                     ):

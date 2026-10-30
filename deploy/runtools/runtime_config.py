@@ -39,6 +39,7 @@ from runtools.simulation_data_classes import (
     PartitionConfig,
 )
 from runtools.utils import is_on_aws
+from runtools import card_scope
 from util.inheritors import inheritors
 from util.deepmerge import deep_merge
 from util.streamlogger import InfoStreamLogger
@@ -515,6 +516,13 @@ class RuntimeHWConfig:
         need_sudo = "sudo" if is_on_aws() else ""
 
         screen_name = "fsim{}".format(slotid)
+        # [TWO-CARD] card-scoped: fsim<slot>-<bus>, <bus> taken from the very +bus=0x..
+        # the driver is started with, so two managers on one host never share a
+        # screen name. Metasimulations (no +bus) keep the stock name.
+        if card_scope.enabled() and "+bus=0x" in (extra_args or ""):
+            screen_name = card_scope.screen_name(
+                slotid, card_scope.bus_from_driver_args(extra_args)
+            )
 
         # TODO: supernode support (tracefile, trace-select.. etc)
         permissive_driver_args = []

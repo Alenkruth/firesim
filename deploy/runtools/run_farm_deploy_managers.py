@@ -6,6 +6,7 @@ import re
 import logging
 import abc
 import json
+import contextlib
 from fabric.api import prefix, local, run, env, cd, warn_only, put, settings, hide  # type: ignore
 from fabric.contrib.project import rsync_project  # type: ignore
 from os.path import join as pjoin
@@ -16,6 +17,7 @@ from util.streamlogger import StreamLogger
 from awstools.awstools import terminate_instances, get_instance_ids_for_instances
 from runtools.utils import has_sudo, run_only_aws, check_script, is_on_aws, script_path
 from buildtools.bitbuilder import get_deploy_dir
+from runtools import card_scope
 
 from typing import List, Dict, Optional, Union, Tuple, TYPE_CHECKING
 
@@ -107,6 +109,11 @@ class InstanceDeployManager(metaclass=abc.ABCMeta):
 
         """
         raise NotImplementedError
+
+    def card_screen_names(self) -> Optional[List[str]]:
+        """[TWO-CARD] screen names owned by this manager in card-scoped mode;
+        None (stock behavior) otherwise or on platforms without card scoping."""
+        return None
 
     def instance_logger(self, logstr: str, debug: bool = False) -> None:
         """Log with this host's info as prefix."""
@@ -450,12 +457,20 @@ class InstanceDeployManager(metaclass=abc.ABCMeta):
         simdrivers = []
         switches = []
         pipes = []
+        # [TWO-CARD] card-scoped: count only this manager's fsim<slot>-<bus> screens
+        own_screens = self.card_screen_names()
+        own_re = card_scope.screen_regex(own_screens) if own_screens else None
         with settings(warn_only=True), hide("everything"):
             collect = run("screen -ls")
             for line in collect.splitlines():
                 if "(Detached)" in line or "(Attached)" in line:
                     line_stripped = line.strip()
-                    if "fsim" in line:
+                    if own_re is not None and "fsim" in line:
+                        if own_re.search(line + " ") is not None:
+                            m = re.search(r"\.fsim([0-9]+)-", line_stripped)
+                            assert m is not None
+                            simdrivers.append(m.group(1))
+                    elif "fsim" in line:
                         re_search_results = re.search(
                             "fsim([0-9][0-9]*)", line_stripped
                         )
@@ -1052,10 +1067,53 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
     def __init__(self, parent_node: Inst) -> None:
         super().__init__(parent_node)
         self.PLATFORM_NAME = None
+        self._card_buses: Optional[List[str]] = None
+
+    def card_buses(self) -> List[str]:
+        """[TWO-CARD] bus of each slot, from this config's own fpga db."""
+        if self._card_buses is None:
+            self._card_buses = card_scope.db_buses(self.parent_node.get_fpga_db())
+        return self._card_buses
+
+    def card_screen_names(self) -> Optional[List[str]]:
+        if not card_scope.enabled() or self.parent_node.metasimulation_enabled:
+            return None
+        buses = self.card_buses()
+        return [
+            card_scope.screen_name(slotno, buses[slotno])
+            for slotno in range(len(self.parent_node.sim_slots))
+        ]
+
+    def kill_sim_slot(self, slotno: int) -> None:
+        if not card_scope.enabled() or self.parent_node.metasimulation_enabled:
+            return super().kill_sim_slot(slotno)
+        # [TWO-CARD] kill only the driver started with this slot's +bus=0x<bus>
+        if self.instance_assigned_simulations():
+            assert slotno < len(self.parent_node.sim_slots)
+            server = self.parent_node.sim_slots[slotno]
+            driver = server.get_resolved_server_hardware_config().get_local_driver_binaryname()
+            bus = self.card_buses()[slotno]
+            self.instance_logger(
+                f"Killing {self.sim_type_message} simulation for slot: {slotno} (bus 0x{bus} only)."
+            )
+            with warn_only():
+                run(card_scope.kill_command(driver, bus))
+
+    def _require_xdma_loaded_scoped(self) -> None:
+        """[TWO-CARD] card-scoped mode never loads/unloads xdma (host-wide)."""
+        if run("lsmod | grep -wq xdma", warn_only=True).return_code != 0:
+            raise Exception(
+                "[TWO-CARD] FIRESIM_CARD_SCOPED=1 but the xdma module is not loaded; "
+                "card-scoped infrasetup never loads it (host-wide). Abort."
+            )
 
     def load_xdma(self) -> None:
         """load the xdma kernel module."""
         if self.instance_assigned_simulations():
+            if card_scope.pcie_scoped():
+                # [TWO-CARD] no insmod: the module stayed loaded and this card was
+                # re-probed by the root-port rescan in firesim-fpga-util.py.
+                self._require_xdma_loaded_scoped()
             # load xdma if unloaded
             if run("lsmod | grep -wq xdma", warn_only=True).return_code != 0:
                 self.instance_logger("Loading XDMA Driver Kernel Module.")
@@ -1071,6 +1129,13 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
 
     def unload_xdma(self) -> None:
         """unload the xdma kernel module."""
+        if self.instance_assigned_simulations() and card_scope.pcie_scoped():
+            # [TWO-CARD] never rmmod: it unbinds every card on the host.
+            # firesim-fpga-util.py --card-scoped removes/rescans only this BDF and
+            # refuses (as root) while a process holds this card's xdma nodes.
+            self._require_xdma_loaded_scoped()
+            self.instance_logger("[TWO-CARD] card-scoped: xdma stays loaded.")
+            return
         if self.instance_assigned_simulations():
             # unload xdma if loaded
             if run("lsmod | grep -wq xdma", warn_only=True).return_code == 0:
@@ -1135,7 +1200,10 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
                         f"{get_deploy_dir()}/../platforms/{self.PLATFORM_NAME}/scripts"
                     ),
                 )
-                run(f"""{cmd} --bitstream {bit} --bdf {bdf} --fpga-db {json_db}""")
+                # [TWO-CARD] --card-scoped: holder check, rescan of this card's root
+                # port only (never the global rescan), masked COMMAND write
+                scoped = " --card-scoped" if card_scope.pcie_scoped() else ""
+                run(f"""{cmd} --bitstream {bit} --bdf {bdf} --fpga-db {json_db}{scoped}""")
 
     def change_pcie_perms(self) -> None:
         if self.instance_assigned_simulations():
@@ -1179,19 +1247,35 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
             # This is a sim-host node.
 
             # copy sim infrastructure
-            for slotno in range(len(self.parent_node.sim_slots)):
-                self.copy_sim_slot_infrastructure(slotno, uridir)
-                self.extract_driver_tarball(slotno)
+            # [TWO-CARD] card-scoped: build lock SHARED while the driver tarball is
+            # copied, so another manager's make/tar (exclusive) cannot re-tar it
+            # mid-copy; copies of the two cards still overlap.
+            copy_lock = (
+                card_scope.CardLock(rootLogger, "build", shared=True)
+                if card_scope.enabled()
+                else contextlib.nullcontext()
+            )
+            with copy_lock:
+                for slotno in range(len(self.parent_node.sim_slots)):
+                    self.copy_sim_slot_infrastructure(slotno, uridir)
+                    self.extract_driver_tarball(slotno)
 
             if not metasim_enabled:
-                # unload xdma driver
-                self.unload_xdma()
-                # flash fpgas
-                self.flash_fpgas()
-                # load xdma driver
-                self.load_xdma()
-                # change pcie permissions
-                self.change_pcie_perms()
+                # [TWO-CARD] card-scoped: one flash at a time host-wide
+                flash_lock = (
+                    card_scope.CardLock(rootLogger, "flash")
+                    if card_scope.enabled()
+                    else contextlib.nullcontext()
+                )
+                with flash_lock:
+                    # unload xdma driver
+                    self.unload_xdma()
+                    # flash fpgas
+                    self.flash_fpgas()
+                    # load xdma driver
+                    self.load_xdma()
+                    # change pcie permissions
+                    self.change_pcie_perms()
 
         if self.instance_assigned_switches():
             # all nodes could have a switch
