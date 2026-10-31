@@ -1,24 +1,24 @@
 [submodule "platforms/f1/aws-fpga"]
 	path = platforms/f1/aws-fpga
-	url = https://github.com/firesim/aws-fpga-firesim
+	url = git@github.com:firesim/aws-fpga-firesim
 [submodule "utils/FlameGraph"]
 	path = utils/fireperf/FlameGraph
-	url = https://github.com/brendangregg/FlameGraph.git
+	url = git@github.com:brendangregg/FlameGraph.git
 [submodule "platforms/xilinx_vcu118/garnet-firesim"]
 	path = platforms/xilinx_vcu118/garnet-firesim
-	url = https://github.com/firesim/garnet-firesim
+	url = git@github.com:firesim/garnet-firesim
 [submodule "platforms/rhsresearch_nitefury_ii/NiteFury-and-LiteFury-firesim"]
 	path = platforms/rhsresearch_nitefury_ii/NiteFury-and-LiteFury-firesim
-	url = https://github.com/firesim/NiteFury-and-LiteFury-firesim.git
+	url = git@github.com:firesim/NiteFury-and-LiteFury-firesim.git
 [submodule "sim/rocket-chip"]
 	path = sim/rocket-chip
-	url = https://github.com/chipsalliance/rocket-chip.git
+	url = git@github.com:chipsalliance/rocket-chip.git
 [submodule "sim/berkeley-hardfloat"]
 	path = sim/berkeley-hardfloat
-	url = https://github.com/ucb-bar/berkeley-hardfloat.git
+	url = git@github.com:ucb-bar/berkeley-hardfloat.git
 [submodule "sim/diplomacy"]
 	path = sim/diplomacy
-	url = https://github.com/chipsalliance/diplomacy.git
+	url = git@github.com:chipsalliance/diplomacy.git
 [submodule "sim/cde"]
 	path = sim/cde
-	url = https://github.com/chipsalliance/cde.git
+	url = git@github.com:chipsalliance/cde.git
