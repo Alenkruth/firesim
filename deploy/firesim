@@ -458,6 +458,14 @@ def main(args: argparse.Namespace) -> None:
     # we elastically spin instances up/down. we can easily get re-used IPs with
     # different keys. also, probably won't get MITM'd
     env.disable_known_hosts = True
+    # [SSH-PEM 2026-10-31, owner] log in with ~/.ssh/firesim.pem only: no ssh-agent, no default ~/.ssh keys.
+    # The agent/default-key fallback hit the passphrase-protected id_ed25519 on ~1/60 parallel two-card launches
+    # ("Needed to prompt for a connection ... ambiguous in parallel mode" -> kit handoff:no_uartlog + reflash).
+    _pem = os.path.expanduser('~/.ssh/firesim.pem')
+    if os.path.isfile(_pem):
+        env.key_filename = [_pem]
+        env.no_agent = True
+        env.no_keys = True
 
     rootLogger.info("FireSim Manager. Docs: https://docs.fires.im\nRunning: %s\n", str(args.task))
 

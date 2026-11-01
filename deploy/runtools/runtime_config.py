@@ -519,9 +519,13 @@ class RuntimeHWConfig:
         # [TWO-CARD] card-scoped: fsim<slot>-<bus>, <bus> taken from the very +bus=0x..
         # the driver is started with, so two managers on one host never share a
         # screen name. Metasimulations (no +bus) keep the stock name.
-        if card_scope.enabled() and "+bus=0x" in (extra_args or ""):
+        # [SCREEN-FIX 2026-10-31] the driver's +bus=0x.. arrives in extra_plusargs (firesim_topology_elements
+        # passes extra_args=""), so look in both; with only extra_args the screen stayed "fsim0", the scoped
+        # monitor never matched it and terminated every launch at its first poll (~3 s).
+        bus_args = " ".join(a for a in (extra_args, extra_plusargs) if a)
+        if card_scope.enabled() and "+bus=0x" in bus_args:
             screen_name = card_scope.screen_name(
-                slotid, card_scope.bus_from_driver_args(extra_args)
+                slotid, card_scope.bus_from_driver_args(bus_args)
             )
 
         # TODO: supernode support (tracefile, trace-select.. etc)
