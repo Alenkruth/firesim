@@ -314,6 +314,56 @@ if {$ENABLE_XDMA_INTFC_PBLOCK} {
 }
 
 # ---------------------------------------------------------------------------
+# Ceviche CRF soft pblocks (owner 2026-11-03, RULES C "Ceviche area": an owner-approved
+# exception to "stock placer directives only").  Reason, cell paths and placement evidence:
+# claude-artifacts/ift-overhaul/execution/diffs/cev-pblock-20261103/REASON.md.
+# In the routed AllDef build (no pblock) dcache/cevCrf (44k LUT / 42k FF, all flops) sat in
+# SLR1 rows Y5-Y6 on the PCIe side (X4..X7): it made the placer level-5/6 windows there
+# (cevCrf 50-84%) and crowded pblock_xdma_intfc (X6Y4:X7Y5; xdma_axi_aclk 0.115 -> 0.012).
+#   pblock_cev_crf : SLR1 west of the PCIe columns and above the PCIe rows, next to the D$
+#                    (row Y7, X4-X6) and the LSU.  Same SLR as the D$: the CRF's 1024-bit
+#                    match/increment vectors and its s1 search must not cross an SLL.
+#   pblock_cev_icrf: SLR3 rows Y12-Y13 with the I$ arrays / frontend; some of its cells are on
+#                    the TAGE-count -> I$ address path (core200), which already ends there.
+# SOFT both: the 2026-08-30 hard pblocks made the design unroutable.  Single-SLR regions.
+# ---------------------------------------------------------------------------
+set ENABLE_CEV_PBLOCK 1
+set cev_crf_region  {CLOCKREGION_X3Y6:CLOCKREGION_X5Y7 CLOCKREGION_X4Y5:CLOCKREGION_X5Y5}
+set cev_icrf_region {CLOCKREGION_X4Y12:CLOCKREGION_X6Y13}
+if {$ENABLE_CEV_PBLOCK} {
+    set _cev_list [list \
+        pblock_cev_crf  ${boom_root}/dcache/cevCrf           $cev_crf_region \
+        pblock_cev_icrf ${boom_root}/frontend/icache/cevICrf $cev_icrf_region]
+    set _cev_found 0
+    foreach {_pbn _path _reg} $_cev_list {
+        if {[llength [get_cells -quiet $_path]] > 0} { incr _cev_found }
+    }
+    if {$_cev_found == 0} {
+        puts "INFO: \[cev\] no Ceviche CRF in this netlist -- pblock_cev_crf/pblock_cev_icrf skipped"
+    } else {
+        foreach {_pbn _path _reg} $_cev_list {
+            set _c [get_cells -quiet $_path]
+            if {[llength [get_pblocks -quiet $_pbn]] > 0} {
+                # IDR/RQS hooks re-source this file; a dcp that already carries the pblock keeps it
+                puts "INFO: \[cev\] $_pbn already present -- kept"
+            } elseif {[llength $_c] == 0} {
+                puts "CRITICAL WARNING: \[cev\] $_path not found (Ceviche hierarchy changed?) -- $_pbn NOT APPLIED"
+            } elseif {[catch {
+                create_pblock $_pbn
+                add_cells_to_pblock [get_pblocks $_pbn] $_c
+                foreach _r $_reg { resize_pblock [get_pblocks $_pbn] -add $_r }
+                set_property IS_SOFT 1 [get_pblocks $_pbn]
+            } err]} {
+                catch {delete_pblocks [get_pblocks -quiet $_pbn]}
+                puts "CRITICAL WARNING: \[cev\] creating $_pbn failed (non-fatal, removed): $err -- NOT APPLIED"
+            } else {
+                puts "INFO: \[cev\] $_pbn SOFT over $_reg: [llength [get_cells -quiet -hierarchical -filter "NAME =~ ${_path}/* && IS_PRIMITIVE"]] leaf cells under $_path"
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Loud summary: a silent no-op here cost a full 14h build on 2026-08-25.
 # Never errors out (would kill a multi-hour run) -- just makes failure visible.
 # ---------------------------------------------------------------------------
