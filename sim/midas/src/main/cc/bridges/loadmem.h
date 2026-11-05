@@ -60,6 +60,11 @@ private:
   const LOADMEMWIDGET_struct mmio_addrs;
   const AXI4Config mem_conf;
   const unsigned mem_data_chunk;
+  // [SPARSELOAD 2026-11-05] +sparse-loadmem: after zero_out_dram() has run in
+  // this launch, ELF segment beats that are all zero are not written (DRAM already
+  // holds 0 there). Off unless the plusarg is given AND the zero sweep ran.
+  bool skip_zero_requested = false;
+  bool dram_zeroed = false;
 };
 
 #endif // __LOADMEM_H

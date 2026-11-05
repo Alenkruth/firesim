@@ -21,6 +21,10 @@ loadmem_t::loadmem_t(simif_t &simif,
     : widget_t(simif, &KIND), mmio_addrs(mmio_addrs), mem_conf(mem_conf),
       mem_data_chunk(mem_data_chunk) {
   assert(index == 0 && "only one loadmem widget is allowed");
+  for (auto &arg : args) {
+    if (arg.find("+sparse-loadmem") == 0)
+      skip_zero_requested = true;
+  }
 }
 
 // Load a sparse ELF file by writing each PT_LOAD segment directly via DMA.
@@ -70,6 +74,17 @@ void loadmem_t::load_mem_from_file(const std::string &filename) {
       // the LoadMem.scala rAddrH fix. Set LOADMEM_VERIFY=1 in the env to re-enable.
       const bool lm_verify = (std::getenv("LOADMEM_VERIFY") != nullptr);
 
+      // [SPARSELOAD 2026-11-05] Skip all-zero beats only when this launch zeroed
+      // DRAM first (+zero-out-dram ran before us, simulation.cc init_dram), so the
+      // resulting DRAM image is byte-identical to a full load. The LoadMem W_DATA
+      // path is MMIO-bound (~275 ns per 32-bit word measured on card 5e), so the
+      // saving is the zero-beat fraction of the image.
+      const bool skip_zero = skip_zero_requested && dram_zeroed;
+      if (skip_zero_requested && !dram_zeroed)
+        fprintf(stdout, "[loadmem] +sparse-loadmem ignored: DRAM was not zeroed in this launch\n");
+      const size_t beat_bytes = (size_t)mem_data_chunk * sizeof(uint32_t);
+      uint64_t beats_total = 0, beats_skipped = 0;
+
       for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr phdr;
         elf.seekg(ehdr.e_phoff + i * ehdr.e_phentsize);
@@ -96,8 +111,35 @@ void loadmem_t::load_mem_from_file(const std::string &filename) {
           size_t to_read = std::min((uint64_t)chunk_bytes, remaining);
           std::fill(buf.begin(), buf.end(), 0);
           elf.read(reinterpret_cast<char*>(buf.data()), to_read);
-          mpz_import(mpz_buf, to_read, -1, 1, 0, 0, buf.data());
-          write_mem_chunk(cur_offset, mpz_buf, to_read);
+          if (skip_zero && (cur_offset % beat_bytes) == 0) {
+            // Write each maximal run of beats that hold a nonzero byte; zero beats
+            // are left as the zero sweep wrote them. A partial last beat is padded
+            // with zeros by write_mem_chunk exactly as in the full path.
+            const size_t nbeats = (to_read + beat_bytes - 1) / beat_bytes;
+            auto beat_nonzero = [&](size_t b) {
+              const size_t lo = b * beat_bytes;
+              const size_t hi = std::min(to_read, lo + beat_bytes);
+              for (size_t k = lo; k < hi; k++)
+                if (buf[k]) return true;
+              return false;
+            };
+            size_t b = 0;
+            while (b < nbeats) {
+              if (!beat_nonzero(b)) { b++; beats_skipped++; continue; }
+              size_t e = b + 1;
+              while (e < nbeats && beat_nonzero(e)) e++;
+              const size_t lo = b * beat_bytes;
+              const size_t hi = std::min(to_read, e * beat_bytes);
+              mpz_import(mpz_buf, hi - lo, -1, 1, 0, 0, buf.data() + lo);
+              write_mem_chunk(cur_offset + lo, mpz_buf, hi - lo);
+              b = e;
+            }
+            beats_total += nbeats;
+          } else {
+            mpz_import(mpz_buf, to_read, -1, 1, 0, 0, buf.data());
+            write_mem_chunk(cur_offset, mpz_buf, to_read);
+            beats_total += (to_read + beat_bytes - 1) / beat_bytes;
+          }
           cur_offset += to_read;
           remaining -= to_read;
         }
@@ -160,6 +202,9 @@ void loadmem_t::load_mem_from_file(const std::string &filename) {
           mpz_clear(rb);
         }
       }
+      if (skip_zero)
+        fprintf(stdout, "[loadmem] sparse-loadmem: %" PRIu64 " of %" PRIu64 " beats were zero and not written\n",
+                beats_skipped, beats_total);
       fprintf(stdout, "[loadmem] ELF load done\n");
       return;
     }
@@ -238,6 +283,7 @@ void loadmem_t::zero_out_dram() {
   simif.write(mmio_addrs.ZERO_OUT_DRAM, 1);
   while (!simif.read(mmio_addrs.ZERO_FINISHED))
     ;
+  dram_zeroed = true;
 }
 
 void loadmem_t::dump_trap_regs(uint64_t mscratch) {
