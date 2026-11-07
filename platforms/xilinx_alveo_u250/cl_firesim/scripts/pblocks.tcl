@@ -314,6 +314,79 @@ if {$ENABLE_XDMA_INTFC_PBLOCK} {
 }
 
 # ---------------------------------------------------------------------------
+# [xdma_pin] XDMA cells wired straight to the PCIe hard block -> pblock_xdma_intfc (AllDef v3 timing
+# fallback, task-reports/alldefv3-timing-20261105/SCOPE.md).  AllDef v3 impl_1 failed by -0.095 ns on
+# udma_wrapper/.../IRQ_INST/clk_msi_req_reg[4] (placed in SLR0) -> PCIE40E4 CFGINTERRUPTMSIINT[4] (SLR1):
+# 0 logic levels, 2.9 ns of one SLR-crossing net.  pblock_xdma_intfc holds only xdma_0/inst/pcie4_ip_i,
+# so the DMA-engine (udma_*) flops on the hard block's own pins were free to leave the PCIe SLR.
+# Rule (computed on the netlist the hook sees, so phys_opt renames do not matter): every leaf cell under
+# design_1_i/xdma_0/inst that shares a SIGNAL net (no clock, no constant net) with a PCIE40E4 pin, is not
+# LOC-fixed, is not a PCIE40E4/GTYE4/BUFG*/IBUFDS* primitive and is not yet in a pblock.  Nets with more
+# than $_xp_maxfo leaf loads are skipped (logged), so a reset/enable tree never drags its whole fan-out in.
+# Idempotent: on an IDR/RQS re-source the cells are already in the pblock and nothing is added.
+# Loud, never an error (an error in this TCL.PRE hook fails the run).
+# EXCLUDE_PLACEMENT stays OFF unless ENABLE_XDMA_INTFC_EXCLUDE is set (option B+ of REPORT.md section 6).
+# ---------------------------------------------------------------------------
+set ENABLE_XDMA_PIN_CELLS 1
+set ENABLE_XDMA_INTFC_EXCLUDE 0
+set _xp_maxfo 64
+if {$ENABLE_XDMA_PIN_CELLS} {
+    set _xp_pb [get_pblocks -quiet pblock_xdma_intfc]
+    set _xp_pc [get_cells -quiet -hierarchical -filter {REF_NAME =~ PCIE40E4*}]
+    if {[llength $_xp_pb] != 1} {
+        puts "CRITICAL WARNING: \[xdma_pin\] pblock_xdma_intfc not present -- XDMA pin cells NOT ADDED"
+    } elseif {[llength $_xp_pc] != 1} {
+        puts "CRITICAL WARNING: \[xdma_pin\] [llength $_xp_pc] PCIE40E4 cells (expected 1) -- XDMA pin cells NOT ADDED"
+    } else {
+        set _xp_add {}
+        set _xp_skipnets 0
+        set _xp_nets [get_nets -quiet -of_objects [get_pins -quiet -of_objects $_xp_pc]]
+        set _xp_nets [filter -quiet $_xp_nets {TYPE == SIGNAL}]
+        foreach _n $_xp_nets {
+            set _lp [get_pins -quiet -leaf -of_objects $_n]
+            if {[llength $_lp] > $_xp_maxfo + 1} {
+                incr _xp_skipnets
+                puts "INFO: \[xdma_pin\] skipped net $_n ([llength $_lp] leaf pins > $_xp_maxfo)"
+                continue
+            }
+            foreach _c [get_cells -quiet -of_objects $_lp] { lappend _xp_add $_c }
+        }
+        set _xp_add [lsort -unique $_xp_add]
+        set _xp_cand [filter -quiet [get_cells -quiet $_xp_add] \
+            {NAME =~ design_1_i/xdma_0/inst/* && IS_PRIMITIVE && PRIMITIVE_LEVEL != INTERNAL && IS_LOC_FIXED == 0 && REF_NAME !~ PCIE40E4* && REF_NAME !~ GTYE4* && REF_NAME !~ BUFG* && REF_NAME !~ IBUFDS*}]
+        set _xp_new {}
+        set _xp_have 0
+        foreach _c $_xp_cand {
+            if {[llength [get_pblocks -quiet -of_objects $_c]] == 0} { lappend _xp_new $_c } else { incr _xp_have }
+        }
+        puts "INFO: \[xdma_pin\] [llength $_xp_nets] signal nets on the PCIE40E4 ($_xp_skipnets skipped as fan-out > $_xp_maxfo), [llength $_xp_cand] XDMA leaf cells on them: $_xp_have already in a pblock, [llength $_xp_new] to add"
+        if {[llength $_xp_new] > 0} {
+            if {[llength $_xp_new] > 5000} {
+                puts "CRITICAL WARNING: \[xdma_pin\] [llength $_xp_new] cells is far above the expected few hundred -- check the rule"
+            }
+            if {[catch { add_cells_to_pblock $_xp_pb [get_cells $_xp_new] } err]} {
+                puts "CRITICAL WARNING: \[xdma_pin\] add_cells_to_pblock failed (non-fatal): $err -- XDMA pin cells NOT ADDED"
+            } else {
+                array unset _xp_rt
+                foreach _g [get_property PRIMITIVE_GROUP [get_cells $_xp_new]] { incr _xp_rt($_g) }
+                foreach _k [lsort [array names _xp_rt]] { puts "INFO: \[xdma_pin\]   added $_k: $_xp_rt($_k)" }
+                array unset _xp_hs
+                foreach _c $_xp_new { incr _xp_hs([join [lrange [split $_c /] 0 5] /]) }
+                foreach _k [lsort [array names _xp_hs]] { puts "INFO: \[xdma_pin\]   added under $_k: $_xp_hs($_k)" }
+                puts "INFO: \[xdma_pin\] pblock_xdma_intfc now [llength [get_cells -quiet -of_objects $_xp_pb]] cells"
+            }
+        }
+        if {$ENABLE_XDMA_INTFC_EXCLUDE} {
+            if {[catch { set_property EXCLUDE_PLACEMENT 1 $_xp_pb } err]} {
+                puts "CRITICAL WARNING: \[xdma_pin\] EXCLUDE_PLACEMENT failed (non-fatal): $err"
+            } else {
+                puts "INFO: \[xdma_pin\] EXCLUDE_PLACEMENT 1 on pblock_xdma_intfc (B+)"
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Ceviche CRF soft pblocks (owner 2026-11-03, RULES C "Ceviche area": an owner-approved
 # exception to "stock placer directives only").  Reason, cell paths and placement evidence:
 # claude-artifacts/ift-overhaul/execution/diffs/cev-pblock-20261103/REASON.md.
