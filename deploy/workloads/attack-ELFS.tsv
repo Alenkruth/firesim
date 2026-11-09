@@ -1,0 +1,14 @@
+workload	source ELF	ELF sha1	image sha1
+spectre-v1	spectre-v1/binrv/spectre_v1_xdom.riscv	479e9f87	fcd73bbb
+spectre-v2	spectre-v2/binrv/spectre_v2_xdom.riscv	e2123154	9ad94626
+spectre-rsb	spectre-rsb/binrv/spectre_rsb_xdom.riscv	db1fb748	1224ae86
+ret2spec	ret2spec-safeside/binrv/ret2spec_ift.riscv	a4b214c4	6adad966
+spectre-ssb	spectre-ssb/binrv/ssb_ift.riscv	853696e5	85cd9e55
+retbleed	retbleed/binrv/retbleed_ift.riscv	45a986f6	fe5893c6
+ff	ff/binrv/ff_ift.riscv	3c28a78c	03b7f729
+fr	fr/binrv/fr_ift.riscv	86ce7b81	4764b6a6
+pp	pp/binrv/pp_ift.riscv	a1c0bc65	d8d63167
+ridl	ridl/binrv/ridl_ift.riscv	cdf69358	73a09537
+portsmash	portsmash/binrv/portsmash.riscv	cbce784a	0ad00fd3
+branchscope	branchscope/binrv/branchscope_word.riscv	2cab747f	cf8383c0
+btb	btb/binrv/btb_word.riscv	187e8180	4cdbdeb5
