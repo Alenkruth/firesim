@@ -131,6 +131,13 @@ private:
   bool do_zero_out_dram = false;
 
   /**
+   * [ZERORANGE 2026-11-10] +zero-out-range=<base>:<len> (hex, target physical address): write zeros
+   * over [base, base + len) through the LoadMem write path before the program load (e.g. the SpecASan tag
+   * storage only); mutually exclusive with +zero-out-dram. Empty = not given.
+   */
+  std::string zero_out_range;
+
+  /**
    * If set, read the presence register, check it, and exit the simulation
    * cleanly
    */

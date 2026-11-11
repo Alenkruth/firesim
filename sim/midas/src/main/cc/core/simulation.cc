@@ -10,6 +10,7 @@
 #include "core/timing.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 
@@ -26,6 +27,9 @@ simulation_t::simulation_t(widget_registry_t &registry,
     }
     if (arg.find("+zero-out-dram") == 0) {
       do_zero_out_dram = true;
+    }
+    if (arg.find("+zero-out-range=") == 0) {
+      zero_out_range = arg.c_str() + 16;
     }
     if (arg.find("+check-fingerprint") == 0) {
       check_fingerprint_only = true;
@@ -190,7 +194,32 @@ void simulation_t::wait_for_init() {
 }
 
 void simulation_t::init_dram() {
+  // [ZERORANGE 2026-11-10] +zero-out-range=<base>:<len>: parsed and checked before any DRAM write; a
+  // malformed value, or both zeroing plusargs at once, stops the launch here (nothing written).
+  uint64_t zr_base = 0, zr_len = 0;
+  if (!zero_out_range.empty()) {
+    const char *s = zero_out_range.c_str();
+    char *e = nullptr;
+    errno = 0;
+    zr_base = strtoull(s, &e, 16);
+    bool ok = (errno == 0 && e != s && *e == ':');
+    if (ok) {
+      const char *s2 = e + 1;
+      zr_len = strtoull(s2, &e, 16);
+      ok = (errno == 0 && e != s2 && *e == '\0');
+    }
+    if (!ok) {
+      fprintf(stderr, "[zero-out-range] REFUSED: '+zero-out-range=%s' is not <base>:<len> in hex\n", s);
+      exit(EXIT_FAILURE);
+    }
+    if (do_zero_out_dram) {
+      fprintf(stderr, "[zero-out-range] REFUSED: +zero-out-range and +zero-out-dram are mutually exclusive\n");
+      exit(EXIT_FAILURE);
+    }
+  }
   if (auto *loadmem = registry.get_widget_opt<loadmem_t>()) {
+    if (!zero_out_range.empty() && !loadmem->zero_mem_range(zr_base, zr_len))
+      exit(EXIT_FAILURE);
     if (do_zero_out_dram) {
       fprintf(stderr,
               "Zeroing out FPGA DRAM. This will take a few seconds...\n");
@@ -201,7 +230,7 @@ void simulation_t::init_dram() {
       loadmem->load_mem_from_file(load_mem_path);
     }
   } else {
-    if (do_zero_out_dram || !load_mem_path.empty()) {
+    if (do_zero_out_dram || !zero_out_range.empty() || !load_mem_path.empty()) {
       fprintf(stderr,
               "Skipping memory initialization: target does not use DRAM\n");
     }

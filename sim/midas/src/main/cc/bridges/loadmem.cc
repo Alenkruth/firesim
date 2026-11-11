@@ -2,6 +2,7 @@
 
 #include "loadmem.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <elf.h>
 #include <fstream>
@@ -284,6 +285,58 @@ void loadmem_t::zero_out_dram() {
   while (!simif.read(mmio_addrs.ZERO_FINISHED))
     ;
   dram_zeroed = true;
+}
+
+// [ZERORANGE 2026-11-10] see loadmem.h. Same register sequence as write_mem_chunk() (one W_ADDRESS_H/L +
+// W_LENGTH per 4 KiB chunk, then the chunk's 32-bit words through W_DATA), with every word 0.
+bool loadmem_t::zero_mem_range(uint64_t paddr, uint64_t len) {
+  const uint64_t kChunk = 4096, kMax = 256ULL << 20;
+  const size_t beat_bytes = (size_t)mem_data_chunk * sizeof(uint32_t);
+  const uint64_t host_bytes = (mem_conf.addr_bits >= 64) ? ~0ULL : (1ULL << mem_conf.addr_bits);
+  const char *why = nullptr;
+  if (paddr < DRAM_BASE)                     why = "base below the DRAM base 0x80000000";
+  else if (len == 0)                         why = "length 0";
+  else if (len > kMax)                       why = "length above 256 MiB (use +zero-out-dram)";
+  else if (paddr % kChunk || len % kChunk)   why = "base or length not a multiple of 4 KiB";
+  else if (kChunk % beat_bytes)              why = "4 KiB is not a multiple of the LoadMem beat";
+  else if (paddr - DRAM_BASE > host_bytes || len > host_bytes - (paddr - DRAM_BASE))
+                                             why = "range beyond the LoadMem address space";
+  if (why) {
+    fprintf(stderr, "[zero-out-range] REFUSED base=0x%" PRIx64 " len=0x%" PRIx64 ": %s\n", paddr, len, why);
+    return false;
+  }
+  const uint64_t off0 = paddr - DRAM_BASE;
+  const size_t beats = kChunk / beat_bytes, words = kChunk / sizeof(uint32_t);
+  const auto t0 = std::chrono::steady_clock::now();
+  for (uint64_t off = off0; off < off0 + len; off += kChunk) {
+    simif.write(mmio_addrs.W_ADDRESS_H, off >> 32);
+    simif.write(mmio_addrs.W_ADDRESS_L, off & ((1ULL << 32) - 1));
+    simif.write(mmio_addrs.W_LENGTH, beats);
+    for (size_t i = 0; i < words; i++)
+      simif.write(mmio_addrs.W_DATA, 0);
+  }
+  // Read back the first and the last beat of the range (the read path is not ordered behind the writer:
+  // a non-zero last beat is read again, up to 3 times, before it counts as a failure).
+  auto beat_zero = [&](uint64_t off) {
+    mpz_t rb;
+    mpz_init(rb);
+    read_mem(off, rb);
+    const bool z = (mpz_sgn(rb) == 0);
+    mpz_clear(rb);
+    return z;
+  };
+  const uint64_t last = off0 + len - beat_bytes;
+  bool ok = beat_zero(off0);
+  bool ok_last = false;
+  for (int i = 0; i < 4 && !ok_last; i++)
+    ok_last = beat_zero(last);
+  const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  fprintf(stderr,
+          "[zero-out-range] %s base=0x%" PRIx64 " len=0x%" PRIx64 " (%" PRIu64 " KiB, %" PRIu64
+          " W_DATA words) in %.3f s; read-back first/last beat %s/%s\n",
+          (ok && ok_last) ? "done" : "FAILED", paddr, len, len >> 10, len / sizeof(uint32_t), s,
+          ok ? "0" : "NONZERO", ok_last ? "0" : "NONZERO");
+  return ok && ok_last;
 }
 
 void loadmem_t::dump_trap_regs(uint64_t mscratch) {
